@@ -13,10 +13,10 @@ from pathlib import Path
 
 CODES: dict[str, int] = {
     "A": 0,
+    "C": 1,
+    "G": 2,
     "T": 3,
-    "G": 1,
-    "C": 2,
-    'N': 4
+    "N": 4,
 }
 
 def n2id(n: str) -> int:

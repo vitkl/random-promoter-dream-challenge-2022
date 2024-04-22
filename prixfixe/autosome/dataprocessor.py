@@ -22,7 +22,8 @@ class AutosomeDataProcessor(DataProcessor):
         shuffle_train: bool=True,
         valid_batch_size: int=4096,
         valid_workers: int=8,
-        shuffle_val: bool=False
+        shuffle_val: bool=False,
+        dataset_kwargs: dict = {},
     ):
         self.train = preprocess_df(path=path_to_training_data,
                                    seqsize=seqsize,
@@ -47,11 +48,13 @@ class AutosomeDataProcessor(DataProcessor):
         self.seqsize = seqsize
         self.plasmid_path = plasmid_path
         self.generator = generator
+        self.dataset_kwargs = dataset_kwargs
 
     def prepare_train_dataloader(self):
         train_ds = SeqDatasetProb(
             self.train, 
             seqsize=self.seqsize,
+            **self.dataset_kwargs,
         )
         train_dl = DataLoader(
             train_ds, 
@@ -69,6 +72,7 @@ class AutosomeDataProcessor(DataProcessor):
         valid_ds = SeqDatasetProb(
             self.valid, 
             seqsize=self.seqsize,
+            **self.dataset_kwargs,
         )
         valid_dl = DataLoader(
             valid_ds, 

@@ -1,7 +1,7 @@
 from .dataprocessor import AutosomeDataProcessor
 from .first_layers_block import AutosomeFirstLayersBlock
 from .coreblock import AutosomeCoreBlock
-from prixfixe.bayesian.final_layers_block import AutosomeFinalLayersBlock
+from prixfixe.autosome.final_layers_block import AutosomeFinalLayersBlock
 from .predictor import AutosomePredictor
 from .trainer import AutosomeTrainer
 

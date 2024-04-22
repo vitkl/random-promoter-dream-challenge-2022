@@ -1,5 +1,6 @@
 from typing import Optional
 
+import einops
 import numpy as np
 import pyro
 import pyro.distributions as dist
@@ -465,19 +466,14 @@ class TFaffinityScanner(PyroModule):
 
     def one_layer_conv2d(self, x):
         # Layer 1 - learning TF-DNA motif  ===============================
+        x = einops.rearrange(x, "r n b -> r b n")
         # shift sequence
         x = self.shift_fn(x)
-        # print("DNA sequence NN fraction", (x == torch.tensor(0.25, device=x.device)).float().mean())
         # get motif weights
         motifs = self._get_motif_weights(use_prior=True)
 
         # Do convolution
-        if not self.use_einsum:
-            x, reverse_complement = self._apply_conv2d(x, motifs, padding=self.padding)
-        else:
-            x, reverse_complement = self._apply_conv2d_einsum(
-                x, motifs, equation="rpn,hwn->rhp"
-            )
+        x, reverse_complement = self._apply_conv2d(x, motifs, padding=self.padding)
 
         # Apply batch norm or layer norm
         if self.use_batch_norm:
@@ -496,15 +492,6 @@ class TFaffinityScanner(PyroModule):
 
         # apply pooling
         x = self.pool1(x)
-
-        # print("m_binding.mean() TF", x.mean((-3, -1)))  # rhp
-        # print("m_binding.max() TF", x.max(-3)[0].max(-1)[0])  # rhp
-        # print("m_binding max - min TF", x.max(-3)[0].max(-1)[0] - x.min(-3)[0].min(-1)[0])  # rhp
-        # print("m_binding max - min TF total", x.max(-3)[0].max(-1)[0].max() - x.max(-3)[0].max(-1)[0].min())  # rhp
-
-        # print("m_binding.mean()", x.mean())
-        # print("m_binding.max()", x.max())
-        # print("m_binding.min()", x.min())
 
         # Output sizes If max-pooling across the entire sequence:
         # [regions, motifs, position] -> [regions, motifs]
@@ -525,7 +512,7 @@ class TFaffinityScanner(PyroModule):
         return x
 
     def two_layer_conv1d(
-        self, x, region_motif_coo_rhp: torch.Tensor = None, width: int = 5
+        self, x, region_motif_coo_rhp: torch.Tensor = None, width: int = 10
     ):
         # Layer 1 - learning Tn5-DNA motif  ===============================
         x_rhp = self.one_layer_conv2d(x)

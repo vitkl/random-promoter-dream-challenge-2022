@@ -8,8 +8,9 @@ from pyro.infer.autoguide.utils import deep_getattr, deep_setattr
 
 from pyro.nn import PyroModule
 from pyro import poutine
-from pyro.infer.autoguide import AutoNormalMessenger, init_to_feasible, init_to_mean
+from pyro.infer.autoguide import AutoHierarchicalNormalMessenger, init_to_feasible, init_to_mean
 import pyro
+import numpy as np
 
 from .TFaffinityScanner import TFaffinityScanner
 
@@ -38,7 +39,7 @@ class BayesianPyroModel(PyroModule):
             tf_affinity_scanner_kwargs = {}
         self.tf_affinity_scanner_kwargs = tf_affinity_scanner_kwargs
 
-    def forward(self, dna_sequence, y_probs=None, y=None):
+    def forward(self, dna_sequence=None, y_probs=None, y=None):
 
         name = "simple_tf_effect_model"
         tf_affinity_scanner_mode = "two_layer_conv1d"
@@ -111,13 +112,13 @@ class BayesianPyroModel(PyroModule):
         return score
 
 
-class RegressionBaseModule(nn.Module):
+class BaseModule(nn.Module):
     def __init__(
         self,
         model,
         guide_kwargs: dict = None,
         init_loc_fn=init_to_mean(fallback=init_to_feasible),
-        guide_class=AutoNormalMessenger,
+        guide_class=AutoHierarchicalNormalMessenger,
         **kwargs,
     ):
         """
@@ -179,24 +180,25 @@ class RegressionBaseModule(nn.Module):
         )
 
 
-class AutosomeFinalLayersBlock(FinalLayersBlock):
+class BayesianFinalLayersBlock(FinalLayersBlock):
     def __init__(
             self,
             in_channels: int, # for compatibity. Isn't used by block itself
-            seqsize: int  # for compatibity. Isn't used by block itself
+            seqsize: int,  # for compatibity. Isn't used by block itself
+            fixed_motifs: np.ndarray = None,
+            n_out: int = 18,
     ):
         super().__init__(in_channels=in_channels,
                          seqsize=seqsize)
-        fixed_motifs = None
-        self.module = RegressionBaseModule(
+        self.pyro_module = BaseModule(
             model=BayesianPyroModel,
             fixed_motifs=fixed_motifs,
-            n_out=18,
+            n_out=n_out,
             tf_affinity_scanner_kwargs={},
         )
 
-    def forward(self, x):
-        score = self.module.model(dna_sequenc=x)
+    def forward(self, dna_sequence):
+        score = self.pyro_module.model(dna_sequenc=dna_sequence)
         return score
 
     def train_step(self, batch, batch_idx):
@@ -208,11 +210,11 @@ class AutosomeFinalLayersBlock(FinalLayersBlock):
             kwargs["y"] = batch["y"].to(self.device)
         # pytorch lightning requires a Tensor object for loss
         loss = self.differentiable_loss_fn(
-            self.scale_fn(self.module.model),
-            self.scale_fn(self.module.guide),
+            self.scale_fn(self.pyro_module.model),
+            self.scale_fn(self.pyro_module.guide),
             **kwargs
         )
-        score = self.module.model(dna_sequence=kwargs["dna_sequence"], y=None, y_probs=None)
+        score = self.pyro_module.model(dna_sequence=kwargs["dna_sequence"], y=None, y_probs=None)
         return score, loss
 
     def weights_init(self, generator: Generator) -> None:

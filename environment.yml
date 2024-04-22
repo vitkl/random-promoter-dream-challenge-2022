@@ -190,3 +190,5 @@ dependencies:
   - pip:
     - biopython==1.81
     - torchinfo==1.8.0
+    - pyro-ppl==1.8.6
+    - einops
