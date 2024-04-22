@@ -13,14 +13,17 @@ class AutosomePredictor(Predictor):
     def __init__(self,
                  model: nn.Module, 
                  model_pth: str | Path, 
-                 device: torch.device):
+                 device: torch.device,
+                 use_reverse_channel: bool = True,
+                 use_single_channel: bool = True,
+                 ):
 
         self.model = model.to(device)
         self.model.load_state_dict(torch.load(model_pth))
         self.model = self.model.eval()
 
-        self.use_reverse_channel = True
-        self.use_single_channel = True
+        self.use_reverse_channel = use_reverse_channel
+        self.use_single_channel = use_single_channel
         self.seqsize = 150
         self.device = device
 

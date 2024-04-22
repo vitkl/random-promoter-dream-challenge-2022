@@ -102,7 +102,7 @@ class TFaffinityScanner(PyroModule):
         name: str = "",
         fixed_motifs: Optional[np.array] = None,
         n_motifs: int = None,
-        n_binding_modes: int = 4,
+        n_binding_modes: int = 1,
         use_motif_refining: bool = True,
         mode: str = "one_layer_conv2d",
         use_refined_motifs_below_zero: bool = False,
@@ -110,11 +110,11 @@ class TFaffinityScanner(PyroModule):
         seq_length: int = 7,
         n_nucleotides: int = 4,
         motif_loc_mean: float = 0.0,
-        motif_loc_scale: float = 0.1,
-        motif_weight_alpha: float = 10.0,
+        motif_loc_scale: float = 0.01,
+        motif_weight_alpha: float = 100.0,
         n_hidden: int = 128,
         activation_fn: torch.nn.Module = Exp,
-        pool_fn: torch.nn.Module = torch.nn.MaxPool2d,
+        pool_fn: torch.nn.Module = torch.nn.AvgPool2d,
         pool_window: Optional[int] = None,
         pool_stride: Optional[int] = None,
         use_reverse_complement: bool = False,
@@ -344,7 +344,7 @@ class TFaffinityScanner(PyroModule):
         if prior_alpha is None:
             prior_alpha = 1.0
         if getattr(self, f"{name}prior_alpha", None) is None:
-            self.register_buffer(f"{name}prior_alpha", torch.tensor(prior_alpha))
+            self.register_buffer(f"{name}prior_alpha", torch.tensor(np.array(prior_alpha).astype("float32")))
         # Motif weights
         weights_name = f"{name}weight"
         if getattr(self.weights, weights_name, None) is None:
@@ -366,14 +366,14 @@ class TFaffinityScanner(PyroModule):
         if prior_mean is None:
             prior_mean = 0.0
         if getattr(self, f"{name}prior_mean", None) is None:
-            self.register_buffer(f"{name}prior_mean", torch.tensor(prior_mean))
+            self.register_buffer(f"{name}prior_mean", torch.tensor(np.array(prior_mean).astype("float32")))
         if prior_sigma is None:
             prior_sigma = 1.0
         if getattr(self, f"{name}prior_sigma", None) is None:
-            self.register_buffer(f"{name}prior_sigma", torch.tensor(prior_sigma))
+            self.register_buffer(f"{name}prior_sigma", torch.tensor(np.array(prior_sigma).astype("float32")))
         if getattr(self, f"{name}motif_length_tensor", None) is None:
             self.register_buffer(
-                f"{name}motif_length_tensor", torch.tensor(self.motif_length)
+                f"{name}motif_length_tensor", torch.tensor(np.array(self.motif_length).astype("float32"))
             )
         # Motif weights
         weights_name = f"{name}laplace_weight"
@@ -400,31 +400,15 @@ class TFaffinityScanner(PyroModule):
             or self.return_forward_revcomp
             or (not self.training)
         ):
-            # assert torch.allclose(
-            #     torch.nn.functional.conv2d(x, motifs[:, :, :, self.complement_index].flip(-2)).squeeze(-1),
-            #     torch.nn.functional.conv2d(x[:, :, :, self.complement_index].flip(-2), motifs).flip(-2).squeeze(-1)
-            # )
             reverse_complement = torch.nn.functional.conv2d(
                 x,
                 motifs[:, :, :, self.complement_index].flip(-2),
                 padding=padding,
             )
-            if self.use_batch_norm:
-                reverse_complement = self.batch_norm1(reverse_complement)
-            elif self.use_layer_norm:
-                reverse_complement = self.layer_norm1(reverse_complement)
         else:
             reverse_complement = None
-        x = torch.nn.functional.conv2d(x, motifs)
+        x = torch.nn.functional.conv2d(x, motifs, padding=padding)
         # output shape: (n_regions, n_motifs, seq_length - (motif_length - 1), 1)
-
-        # Apply batch norm or layer norm
-        if self.use_batch_norm:
-            # TODO this needs to be 2d
-            x = self.batch_norm1(x)
-        elif self.use_layer_norm:
-            # TODO this needs n_motifs as last dimension
-            x = self.layer_norm1(x)
         return x, reverse_complement
 
     def forward(self, x, **kwargs):
@@ -466,7 +450,6 @@ class TFaffinityScanner(PyroModule):
 
     def one_layer_conv2d(self, x):
         # Layer 1 - learning TF-DNA motif  ===============================
-        x = einops.rearrange(x, "r n b -> r b n")
         # shift sequence
         x = self.shift_fn(x)
         # get motif weights
@@ -474,14 +457,6 @@ class TFaffinityScanner(PyroModule):
 
         # Do convolution
         x, reverse_complement = self._apply_conv2d(x, motifs, padding=self.padding)
-
-        # Apply batch norm or layer norm
-        if self.use_batch_norm:
-            # TODO this needs to be 2d
-            x = self.batch_norm1(x)
-        elif self.use_layer_norm:
-            # TODO this needs n_motifs as last dimension
-            x = self.layer_norm1(x)
 
         # Apply activation
         x = self.activation1(x)

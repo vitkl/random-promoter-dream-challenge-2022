@@ -10,7 +10,7 @@ from pyro.nn import PyroModule
 from pyro import poutine
 from pyro.infer.autoguide import AutoHierarchicalNormalMessenger, init_to_feasible, init_to_mean
 import pyro
-import numpy as np
+from einops import rearrange
 
 from .TFaffinityScanner import TFaffinityScanner
 
@@ -39,7 +39,11 @@ class BayesianPyroModel(PyroModule):
             tf_affinity_scanner_kwargs = {}
         self.tf_affinity_scanner_kwargs = tf_affinity_scanner_kwargs
 
+        self.weights = PyroModule()
+
     def forward(self, dna_sequence=None, y_probs=None, y=None):
+
+        dna_sequence = rearrange(dna_sequence, "r n b -> r b n")
 
         name = "simple_tf_effect_model"
         tf_affinity_scanner_mode = "two_layer_conv1d"
@@ -80,10 +84,9 @@ class BayesianPyroModel(PyroModule):
                 ),
             )
         module = deep_getattr(self.weights, name)
-
-        x_rep = module(dna_sequence)
+        x_rep = module(dna_sequence.unsqueeze(-3))
         x_rep = torch.nn.functional.adaptive_avg_pool1d(x_rep, 1)
-        x_rep = x_rep.squeeze(2)
+        x_rep = x_rep.squeeze(2) / torch.tensor(10.0, device=x_rep.device)
         x_rep = torch.nn.functional.softmax(x_rep, dim=1)
         score = (x_rep * self.bins).sum(dim=1)
 
@@ -97,61 +100,64 @@ class BayesianPyroModel(PyroModule):
                     score,
                     torch.tensor(1.0, device=score.device),
                 ).to_event(2),
-                obs=y_probs,
+                obs=y,
             )
 
         if y_probs is not None:
             pyro.sample(
                 "y_probs",
-                pyro.distributions.Categorical(
-                    x_rep,
-                ).to_event(2),
-                obs=y_probs,
+                pyro.distributions.Multinomial(
+                    probs=x_rep,
+                ).to_event(1),
+                obs=(y_probs > torch.tensor(0.5, device=y_probs.device)).float(),
             )
 
         return score
 
 
-class BaseModule(nn.Module):
+class BayesianFinalLayersBlock(FinalLayersBlock):
     def __init__(
         self,
-        model,
+        in_channels: int,  # for compatibity. Isn't used by block itself
+        seqsize: int,  # for compatibity. Isn't used by block itself
+        model=BayesianPyroModel,
         guide_kwargs: dict = None,
         init_loc_fn=init_to_mean(fallback=init_to_feasible),
         guide_class=AutoHierarchicalNormalMessenger,
+        scale_elbo=1.0,
         **kwargs,
     ):
-        """
-        Module class which defines AutoGuide given model. Supports multiple model architectures.
-
-        Parameters
-        ----------
-        kwargs
-            arguments for specific model class - e.g. number of genes, values of the prior distribution
-        """
-        super().__init__()
-        self.hist = []
+        super().__init__(in_channels=in_channels,
+                         seqsize=seqsize)
 
         self._model = model(**kwargs)
+        if getattr(self._model, "discrete_variables", None) is not None:
+            self._model = poutine.block(self._model, hide=model.discrete_variables)
 
         if guide_kwargs is None:
             guide_kwargs = dict()
-        if getattr(model, "discrete_variables", None) is not None:
-            model = poutine.block(model, hide=model.discrete_variables)
         if issubclass(guide_class, poutine.messenger.Messenger):
             # messenger guides don't need create_plates function
             self._guide = guide_class(
-                model,
+                self.model,
                 init_loc_fn=init_loc_fn,
                 **guide_kwargs,
             )
         else:
             self._guide = guide_class(
-                model,
+                self.model,
                 init_loc_fn=init_loc_fn,
                 **guide_kwargs,
                 create_plates=self.model.create_plates,
             )
+
+        self.loss_fn = pyro.infer.Trace_ELBO()
+        self.differentiable_loss_fn = self.loss_fn.differentiable_loss
+        self.scale_elbo = scale_elbo
+        self.scale_fn = (
+            lambda obj: pyro.poutine.scale(obj, self.scale_elbo) if self.scale_elbo != 1 else obj
+        )
+
     @property
     def model(self):
         return self._model
@@ -159,10 +165,6 @@ class BaseModule(nn.Module):
     @property
     def guide(self):
         return self._guide
-
-    @property
-    def list_obs_plate_vars(self):
-        return self.model.list_obs_plate_vars()
 
     def init_to_value(self, site):
         if getattr(self.model, "np_init_vals", None) is not None:
@@ -179,29 +181,11 @@ class BaseModule(nn.Module):
             init_fn=init_to_mean,
         )
 
-
-class BayesianFinalLayersBlock(FinalLayersBlock):
-    def __init__(
-            self,
-            in_channels: int, # for compatibity. Isn't used by block itself
-            seqsize: int,  # for compatibity. Isn't used by block itself
-            fixed_motifs: np.ndarray = None,
-            n_out: int = 18,
-    ):
-        super().__init__(in_channels=in_channels,
-                         seqsize=seqsize)
-        self.pyro_module = BaseModule(
-            model=BayesianPyroModel,
-            fixed_motifs=fixed_motifs,
-            n_out=n_out,
-            tf_affinity_scanner_kwargs={},
-        )
-
     def forward(self, dna_sequence):
-        score = self.pyro_module.model(dna_sequenc=dna_sequence)
+        score = self.model(dna_sequence=dna_sequence)
         return score
 
-    def train_step(self, batch, batch_idx):
+    def train_step(self, batch):
         """Training step for Pyro training."""
         kwargs = {"dna_sequence": batch["x"].to(self.device)}
         if "y_probs" in batch:  # classification
@@ -210,11 +194,11 @@ class BayesianFinalLayersBlock(FinalLayersBlock):
             kwargs["y"] = batch["y"].to(self.device)
         # pytorch lightning requires a Tensor object for loss
         loss = self.differentiable_loss_fn(
-            self.scale_fn(self.pyro_module.model),
-            self.scale_fn(self.pyro_module.guide),
+            self.scale_fn(self.model),
+            self.scale_fn(self.guide),
             **kwargs
         )
-        score = self.pyro_module.model(dna_sequence=kwargs["dna_sequence"], y=None, y_probs=None)
+        score = self.model(dna_sequence=kwargs["dna_sequence"], y=None, y_probs=None)
         return score, loss
 
     def weights_init(self, generator: Generator) -> None:

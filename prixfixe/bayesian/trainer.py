@@ -16,14 +16,16 @@ def setup_pyro_model(dataloader, pl_module):
 
     Setup occurs before any device movement, so params are iniitalized on CPU.
     """
+    from pyro import clear_param_store
+    clear_param_store()
     for batch in dataloader:
         kwargs = {"dna_sequence": batch["x"].to(pl_module.device)}
         if "y_probs" in batch:  # classification
             kwargs["y_probs"] = batch["y_probs"].to(pl_module.device)
         else:  # regression
             kwargs["y"] = batch["y"].to(pl_module.device)
-        pl_module.pyro_module.guide(**kwargs)
-        pl_module.pyro_module.model(**kwargs)
+        pl_module.guide(**kwargs)
+        pl_module.model(**kwargs)
         break
 
 
