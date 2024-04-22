@@ -37,13 +37,19 @@ class BayesianTrainer(Trainer):
         model_dir: str | Path,
         num_epochs: int,
         lr: float,
-        device: torch.device = torch.device("cpu")):
+        device: torch.device = torch.device("cpu"),
+        use_scheduler: bool = False,
+    ):
         
         weight_decay = 0.01
         max_lr = lr
         # max_lr = self.deduce_max_lr()
         div_factor = 25.0
-        min_lr = max_lr / div_factor
+        self.use_scheduler = use_scheduler
+        if self.use_scheduler:
+            min_lr = max_lr / div_factor
+        else:
+            min_lr = max_lr
         model = model.to(device)
         super().__init__(model=model,
                          dataprocessor=dataprocessor,
@@ -51,24 +57,30 @@ class BayesianTrainer(Trainer):
                          num_epochs=num_epochs,
                          device=device)
         
-        optimizer = torch.optim.Adam(model.parameters(),
-                                      lr = min_lr,)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, #type: ignore
-                                                max_lr=max_lr,
-                                                div_factor=div_factor,
-                                                steps_per_epoch=dataprocessor.train_epoch_size(), 
-                                                epochs=num_epochs, 
-                                                pct_start=0.3,
-                                                three_phase=False)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr = min_lr,
+        )
         self.optimizer=optimizer
-        self.scheduler=scheduler
+        if self.use_scheduler:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, #type: ignore
+                max_lr=max_lr,
+                div_factor=div_factor,
+                steps_per_epoch=dataprocessor.train_epoch_size(),
+                epochs=num_epochs,
+                pct_start=0.3,
+                three_phase=False,
+            )
+            self.scheduler=scheduler
 
     def train_step(self, batch):   
         _, loss = self.model.train_step(batch)
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
-        self.scheduler.step()
+        if self.use_scheduler:
+            self.scheduler.step()
         return loss.item()
     
     def on_epoch_end(self):
