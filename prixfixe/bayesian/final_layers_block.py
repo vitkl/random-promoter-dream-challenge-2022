@@ -25,13 +25,13 @@ def init_to_value(site=None, values={}, init_fn=init_to_mean):
 
 class BayesianPyroModel(PyroModule):
 
-    def __init__(self, fixed_motifs, n_out, tf_affinity_scanner_kwargs=None):
+    def __init__(self, fixed_motifs, n_out, level2_width=10, tf_affinity_scanner_kwargs=None):
 
         super().__init__()
 
         self.fixed_motifs = fixed_motifs
         self.n_out = n_out
-
+        self.level2_width = level2_width
 
         self.register_buffer('bins', torch.arange(start=0, end=n_out, step=1, requires_grad=False))
 
@@ -56,7 +56,7 @@ class BayesianPyroModel(PyroModule):
             else:
                 motif_length = 15
                 n_nucleotides = 4
-                n_motifs = 100
+                n_motifs = 177
             tf_affinity_scanner_kwargs_ = {
                 "name": name,
                 "mode": tf_affinity_scanner_mode,
@@ -84,7 +84,7 @@ class BayesianPyroModel(PyroModule):
                 ),
             )
         module = deep_getattr(self.weights, name)
-        x_rep = module(dna_sequence.unsqueeze(-3))
+        x_rep = module(dna_sequence.unsqueeze(-3), width=self.level2_width)
         x_rep = torch.nn.functional.adaptive_avg_pool1d(x_rep, 1)
         x_rep = x_rep.squeeze(2) / torch.tensor(10.0, device=x_rep.device)
         x_rep = torch.nn.functional.softmax(x_rep, dim=1)
