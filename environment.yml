@@ -193,3 +193,4 @@ dependencies:
     - pyro-ppl==1.8.6
     - einops
     - matplotlib
+    - jupyter

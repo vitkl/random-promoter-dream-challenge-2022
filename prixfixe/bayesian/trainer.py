@@ -74,6 +74,15 @@ class BayesianTrainer(Trainer):
             )
             self.scheduler=scheduler
 
+    def _evaluate(self, batch: dict[str, Any]):
+        with torch.no_grad():
+            X = batch["x"]
+            y = batch["y"]
+            X = X.to(self.device)
+            y = y.float().to(self.device)
+            y_pred = self.model.final.guide.median(X)["y_pred"]
+        return y_pred.cpu(), y.cpu()
+
     def train_step(self, batch):   
         _, loss = self.model.train_step(batch)
         loss.backward()

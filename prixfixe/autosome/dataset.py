@@ -92,14 +92,14 @@ class SeqDatasetProb(Dataset):
         bin = self.ds.bin.values[i]
         
         # generate probabilities corresponding to each class
-        norm = scipy.stats.norm(loc=bin + self.shift, #type: ignore
-                                scale=self.scale)
+        # norm = scipy.stats.norm(loc=bin + self.shift, #type: ignore
+        #                        scale=self.scale)
         
-        cumprobs = norm.cdf(self.POINTS)
-        probs = cumprobs[1:] - cumprobs[:-1]
+        # cumprobs = norm.cdf(self.POINTS)
+        # probs = cumprobs[1:] - cumprobs[:-1]
         return {"x": X.float(), 
-                "y_probs": np.asarray(probs, dtype=np.float32),
-                "y": float(bin) # type: ignore
+                # "y_probs": np.asarray(probs, dtype=np.float32),
+                "y": float(bin),  # type: ignore
                 }
     
     def __len__(self) -> int:

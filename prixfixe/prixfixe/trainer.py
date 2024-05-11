@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import tqdm
+from tqdm.auto import tqdm
 from scipy.stats import pearsonr, spearmanr
 
 from .prix_fixe_net import PrixFixeNet
@@ -85,7 +85,7 @@ class Trainer(metaclass=ABCMeta):
         if not self.model.training:
             self.model = self.model.train()
         lst = []
-        for batch in tqdm.tqdm(self.train_dataloader,
+        for batch in tqdm(self.train_dataloader,
                                total=self.dataprocessor.train_epoch_size(),
                                desc="Train epoch",
                                leave=False):
@@ -101,7 +101,7 @@ class Trainer(metaclass=ABCMeta):
         Fit model using the train dataset from dataprocessor
         """
 
-        for epoch in tqdm.tqdm(range(1, self.num_epochs+1)):
+        for epoch in tqdm(range(1, self.num_epochs+1)):
             losses = self.train_epoch()            
 
             with open(self.model_dir / "all_losses.json", "a") as outp:
@@ -123,7 +123,7 @@ class Trainer(metaclass=ABCMeta):
         
         with torch.inference_mode():
             y_pred_vector, y_vector = [], []
-            for batch in tqdm.tqdm(self.valid_dataloader, 
+            for batch in tqdm(self.valid_dataloader,
                                    desc="Validation", 
                                    leave=False):
             # for batch in self.valid_dataloader:
@@ -148,13 +148,26 @@ class Trainer(metaclass=ABCMeta):
             json.dump({f"epoch_{epoch}": metrics}, outp)
             
 
-    def _evaluate(self, batch: dict[str, Any]):
+    def _evaluate0(self, batch: dict[str, Any]):
         with torch.no_grad():
             X = batch["x"]
             y = batch["y"]
             X = X.to(self.device)
             y = y.float().to(self.device)
             y_pred = self.model.forward(X)
+        return y_pred.cpu(), y.cpu()
+
+    def _evaluate(self, batch: dict[str, Any]):
+        with torch.no_grad():
+            X = batch["x"]
+            y = batch["y"]
+            X = X.to(self.device)
+            y = y.float().to(self.device)
+            from pyro.infer.autoguide import AutoMessenger
+            if isinstance(self.model.final.guide, AutoMessenger):
+                y_pred = self.model.final.guide.median(X)["y_pred"]
+            else:
+                y_pred = self.model.final.model(X)
         return y_pred.cpu(), y.cpu()
 
     def _dump_best(self, metrics):

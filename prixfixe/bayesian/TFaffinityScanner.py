@@ -96,6 +96,7 @@ class Exp(torch.nn.Module):
 class TFaffinityScanner(PyroModule):
 
     use_refined_motifs_below_zero_beta = 5.0
+    name_prefix = ""
 
     def __init__(
         self,
@@ -123,6 +124,16 @@ class TFaffinityScanner(PyroModule):
         use_affinity_scaling_by_motif_complexity: bool = True,
         use_affinity_scaling_by_motif_complexity_detach: bool = False,
         padding: str = "same",
+        n_layers: int = 3,
+        use_sqrt_normalisation: bool = True,
+        use_dilation: bool = False,
+        use_non_residual_dilation: bool = False,
+        use_full_dilated_layer: bool = False,
+        use_competition_normalisation: bool = False,
+        use_hill_function: bool = False,
+        dilation: int = 8,
+        use_normal_prior: bool = False,
+        use_horseshoe_prior: bool = False,
     ):
         super().__init__()
         if fixed_motifs is None and n_motifs is None:
@@ -141,6 +152,17 @@ class TFaffinityScanner(PyroModule):
         self.seq_length = seq_length
         self.n_nucleotides = n_nucleotides
         self.n_hidden = n_hidden
+        self.n_layers = n_layers
+        self.use_sqrt_normalisation = use_sqrt_normalisation
+        self.use_dilation = use_dilation
+        self.use_non_residual_dilation = use_non_residual_dilation
+        self.use_full_dilated_layer = use_full_dilated_layer
+        self.use_competition_normalisation = use_competition_normalisation
+        self.use_hill_function = use_hill_function
+        self.dilation = dilation
+        self.use_normal_prior = use_normal_prior
+        self.use_horseshoe_prior = use_horseshoe_prior
+
         self.complement = {
             "A": "T",
             "C": "G",
@@ -216,6 +238,101 @@ class TFaffinityScanner(PyroModule):
                 "fixed_motifs_tensor",
                 torch.tensor(fixed_motifs.astype("float32")),
             )
+        self.register_buffer("ones", torch.tensor(float(1.0)))
+        self.register_buffer("zeros", torch.tensor(float(0.0)))
+
+    def create_horseshoe_prior(
+        self,
+        name,
+        weights_shape,
+        weights_prior_scale=None,
+        weights_prior_tau=None,
+        scale_distribution=dist.HalfNormal,  # TODO figure out which distribution to use HalfCauchy has mean=Inf so can't use it
+    ):
+        # Create scalar tau (like sd for horseshoe prior) =====================
+        tau_name = f"{name}tau"
+        if getattr(self.weights, tau_name, None) is None:
+            if weights_prior_tau is None:
+                weights_prior_tau = self.weights_prior_tau
+            if getattr(self, f"{tau_name}_scale", None) is None:
+                self.register_buffer(f"{tau_name}_scale", weights_prior_tau)
+            deep_setattr(
+                self.weights,
+                tau_name,
+                PyroSample(
+                    lambda prior: scale_distribution(
+                        getattr(self, f"{tau_name}_scale"),
+                    )
+                    .expand([1])
+                    .to_event(1),
+                ),
+            )
+        tau = deep_getattr(self.weights, tau_name)
+
+        # Create weights (like mean for horseshoe prior) =====================
+        weights_name = f"{name}weights"
+        if getattr(self.weights, weights_name, None) is None:
+            deep_setattr(
+                self.weights,
+                weights_name,
+                PyroSample(
+                    lambda prior: dist.Normal(
+                        self.zeros,
+                        self.ones,
+                    )
+                    .expand(weights_shape)
+                    .to_event(len(weights_shape)),
+                ),
+            )
+        unscaled_weights = deep_getattr(self.weights, weights_name)
+
+        if getattr(self, "use_gamma_horseshoe_prior", False):
+            # Create elementwise lambdas using Gamma distribution (like sd for horseshoe prior) =====================
+            lambdas_name = f"{name}lambdas"
+            if getattr(self.weights, lambdas_name, None) is None:
+                if weights_prior_scale is None:
+                    weights_prior_scale = self.weights_prior_scale
+                if getattr(self, f"{lambdas_name}_scale", None) is None:
+                    self.register_buffer(f"{lambdas_name}_scale", weights_prior_scale)
+                deep_setattr(
+                    self.weights,
+                    lambdas_name,
+                    PyroSample(
+                        lambda prior: dist.Gamma(
+                            tau,
+                            getattr(self, f"{lambdas_name}_scale"),
+                        )
+                        .expand(weights_shape)
+                        .to_event(len(weights_shape)),
+                    ),
+                )
+            lambdas = deep_getattr(self.weights, lambdas_name)
+        else:
+            # Create elementwise lambdas (like sd for horseshoe prior) =====================
+            lambdas_name = f"{name}lambdas"
+            if getattr(self.weights, lambdas_name, None) is None:
+                if weights_prior_scale is None:
+                    weights_prior_scale = self.weights_prior_scale
+                if getattr(self, f"{lambdas_name}_scale", None) is None:
+                    self.register_buffer(f"{lambdas_name}_scale", weights_prior_scale)
+                deep_setattr(
+                    self.weights,
+                    lambdas_name,
+                    PyroSample(
+                        lambda prior: scale_distribution(
+                            getattr(self, f"{lambdas_name}_scale"),
+                        )
+                        .expand(weights_shape)
+                        .to_event(len(weights_shape)),
+                    ),
+                )
+            lambdas = deep_getattr(self.weights, lambdas_name)
+            lambdas = tau * lambdas
+
+        weights = lambdas * unscaled_weights
+        if not self.training:
+            pyro.deterministic(f"{self.name_prefix}{name}", weights)
+        return weights
 
     def _get_motif_weights(
         self,
@@ -233,6 +350,10 @@ class TFaffinityScanner(PyroModule):
         if use_refined_motifs_below_zero is None:
             use_refined_motifs_below_zero = self.use_refined_motifs_below_zero
 
+        weights_prior = dist.SoftLaplace
+        if self.use_normal_prior:
+            weights_prior = dist.Normal
+
         if self.use_motif_refining:
             # Motif weights
             weights_name = f"{name}motif_loc"
@@ -241,7 +362,7 @@ class TFaffinityScanner(PyroModule):
                     self.weights,
                     weights_name,
                     PyroSample(
-                        lambda prior: dist.SoftLaplace(
+                        lambda prior: weights_prior(
                             self.motif_loc_mean,
                             self.motif_loc_scale,
                         )
@@ -371,18 +492,31 @@ class TFaffinityScanner(PyroModule):
             prior_sigma = 1.0
         if getattr(self, f"{name}prior_sigma", None) is None:
             self.register_buffer(f"{name}prior_sigma", torch.tensor(np.array(prior_sigma).astype("float32")))
+        if getattr(self, f"{name}prior_tau", None) is None:
+            self.register_buffer(f"{name}prior_tau", torch.tensor(np.array(1.0).astype("float32")))
         if getattr(self, f"{name}motif_length_tensor", None) is None:
             self.register_buffer(
                 f"{name}motif_length_tensor", torch.tensor(np.array(self.motif_length).astype("float32"))
             )
+        if (prior_mean == 0.0) and self.use_horseshoe_prior:
+            return self.create_horseshoe_prior(
+                name=name,
+                weights_shape=shape,
+                weights_prior_scale=getattr(self, f"{name}prior_sigma", None),
+                weights_prior_tau=getattr(self, f"{name}prior_tau", None),
+                scale_distribution=dist.HalfNormal,
+            )
         # Motif weights
+        weights_prior = dist.SoftLaplace
+        if self.use_normal_prior:
+            weights_prior = dist.Normal
         weights_name = f"{name}laplace_weight"
         if getattr(self.weights, weights_name, None) is None:
             deep_setattr(
                 self.weights,
                 weights_name,
                 PyroSample(
-                    lambda prior: dist.SoftLaplace(
+                    lambda prior: weights_prior(
                         getattr(self, f"{name}prior_mean"),
                         getattr(self, f"{name}prior_sigma"),
                     )
@@ -430,6 +564,19 @@ class TFaffinityScanner(PyroModule):
             )
             # sum across nucleotides, sum across positions, sum across binding modes
             return motifs_tensor.abs().sum(-1).sum(-1).sum(-1).sum(-1)
+
+    def hill_function(self, x, ka, n):
+        y = (
+            torch.ones((), device=x.device)
+            / (
+                torch.ones((), device=x.device)
+                # prevent division by zero
+                + (ka / (x + torch.tensor(1e-6, device=x.device))) ** n
+                # keep 0s as 0s
+            )
+        ) * (x.detach() > torch.zeros((), device=x.device)).float()
+
+        return y
 
     def compute_motif_complexity_1d(
         self, motifs_tensor: torch.Tensor, n_binding_modes=1
@@ -480,64 +627,388 @@ class TFaffinityScanner(PyroModule):
                 else motifs.detach(),
                 n_binding_modes=self.n_binding_modes,
             ) / torch.tensor(50.0, device=motifs.device)
-            # print("motif_complexity mean", motif_complexity.mean())
-            x = torch.einsum("rhp,h->rhp", x, motif_complexity)
+            if self.return_forward_revcomp:
+                x = torch.einsum("rhpo,h->rhpo", x, motif_complexity)
+            else:
+                # print("motif_complexity mean", motif_complexity.mean())
+                x = torch.einsum("rhp,h->rhp", x, motif_complexity)
         else:
             x = x / torch.tensor(50.0, device=motifs.device)
         return x
 
+    def residual_layer(self, x1_rhp, region_motif_coo_rhp: torch.Tensor = None, width: int = 10, layer=2):
+        n_motifs = x1_rhp.shape[-2]
+        scaling = 1.0
+        if self.use_sqrt_normalisation:
+            scaling = 1.0 / np.sqrt(n_motifs * width)
+        weights = self._get_weights(
+            shape=[n_motifs, n_motifs, width],
+            name=f"tn5_layer{layer}",
+            prior_mean=0.0,
+            prior_sigma=scaling,
+        )
+        weights = (
+            weights + weights.flip(-1)
+        ) / torch.tensor(2.0, device=weights.device)
+        residual_weight = self._get_positive_weights(
+            shape=[1, n_motifs, 1],
+            name=f"tn5_layer{layer}_residual",
+            prior_alpha=2.0,
+        )
+        # {N, in, L} & {out, in, L} + residual
+        x_rhp = torch.nn.functional.conv1d(x1_rhp, weights, padding="same")
+        x_rhp = x_rhp / torch.tensor(5.0, device=x_rhp.device)
+        x_rhp = torch.nn.functional.softplus(x_rhp) * x1_rhp
+        if region_motif_coo_rhp is not None:
+            x_rhp = torch.concat([x_rhp, x1_rhp * residual_weight], dim=-2)
+        else:
+            x_rhp = (x_rhp + x1_rhp * residual_weight) / torch.tensor(2.0, device=x_rhp.device)
+        # print(f"x_rhp {layer} mean", x_rhp.mean())
+        # print(f"x_rhp {layer} min", x_rhp.min())
+        # print(f"x_rhp {layer} max", x_rhp.max())
+        return x_rhp
+
+    def dilated_layer(
+        self,
+        x1_rhp: torch.Tensor,
+        x_sums_rhp: torch.Tensor,
+        width: int = 3,
+        dilation: int = 1,
+        layer=2,
+    ):
+        n_motifs = x1_rhp.shape[-2]
+        scaling = 1.0
+        if self.use_sqrt_normalisation:
+            scaling = 1.0 / np.sqrt(n_motifs * width)
+        weights = self._get_weights(
+            shape=[n_motifs, n_motifs, width],
+            name=f"tn5_layer{layer}",
+            prior_mean=0.0,
+            prior_sigma=scaling,
+        )
+        weights = (
+            weights + weights.flip(-1)
+        ) / torch.tensor(2.0, device=weights.device)
+        dilated_weight = self._get_positive_weights(
+            shape=[n_motifs, 1, width],
+            name=f"tn5_layer{layer}_dilated",
+            prior_alpha=1.0,
+        )
+        dilated_weight = (
+            dilated_weight + dilated_weight.flip(-1)
+        ) / torch.tensor(2.0, device=dilated_weight.device)
+        residual_weight = self._get_positive_weights(
+            shape=[1, n_motifs, 1],
+            name=f"tn5_layer{layer}_residual",
+            prior_alpha=2.0,
+        )
+        # {N, in, L} & {out, in, L} + residual
+        x_sums_rhp = torch.nn.functional.conv1d(
+            x_sums_rhp, dilated_weight,
+            groups=n_motifs,
+            dilation=dilation,
+            padding="same"
+        ) / torch.tensor(2.0, device=x_sums_rhp.device) # / torch.tensor(float(dilation), device=x_sums_rhp.device)
+        x_rhp = torch.nn.functional.conv1d(
+            x_sums_rhp, weights,
+            padding="same"
+        )
+        x_rhp = x_rhp / torch.tensor(5.0, device=x_rhp.device)
+        x_rhp = torch.nn.functional.softplus(x_rhp) * x1_rhp
+        x_rhp = (x_rhp + x1_rhp * residual_weight) / torch.tensor(2.0, device=x_rhp.device)
+        # print(f"x_rhp {layer} mean", x_rhp.mean())
+        # print(f"x_rhp {layer} min", x_rhp.min())
+        # print(f"x_rhp {layer} max", x_rhp.max())
+        return x_rhp, x_sums_rhp
+
+    def full_dilated_layer(
+        self,
+        x1_rhp: torch.Tensor,
+        width: int = 3,
+        dilation: int = 7,
+        layer=2,
+    ):
+        if self.return_forward_revcomp:
+            n_motifs = x1_rhp.shape[-3]
+        else:
+            n_motifs = x1_rhp.shape[-2]
+        scaling = 1.0
+        if self.use_sqrt_normalisation:
+            scaling = 1.0 / np.sqrt(n_motifs * width)
+        residual_weight = self._get_positive_weights(
+            shape=[1, n_motifs, 1] if not self.return_forward_revcomp else [1, n_motifs, 1, 1],
+            name=f"tn5_layer{layer}_residual",
+            prior_alpha=2.0,
+        )
+        x_rhp = torch.zeros(x1_rhp.shape, device=x1_rhp.device)
+        x_sums_rhp = x1_rhp
+        for i in range(dilation):
+            i = i + 1
+            weights = self._get_weights(
+                shape=[n_motifs, n_motifs, 1]
+                if not self.return_forward_revcomp else [2 * n_motifs, 2 * n_motifs, 1],
+                name=f"tn5_layer{layer}_dilation{i}",
+                prior_mean=0.0,
+                prior_sigma=scaling,
+            )
+            dilated_weight = self._get_positive_weights(
+                shape=[n_motifs, 1, width]
+                if not self.return_forward_revcomp else [n_motifs, 1, width],
+                name=f"tn5_layer{layer}_dilated_dilation{i}",
+                prior_alpha=1.0,
+            )
+            if not self.return_forward_revcomp:
+                dilated_weight = (
+                    dilated_weight + dilated_weight.flip(-1)
+                ) / torch.tensor(2.0, device=x_rhp.device)
+                # {N, in, L} & {out, in, L} + residual
+                x_sums_rhp = torch.nn.functional.conv1d(
+                    x_sums_rhp, dilated_weight,
+                    groups=n_motifs,
+                    dilation=2 ** (i - 1),
+                    padding="same"
+                ) / torch.tensor(2.0, device=x1_rhp.device)
+                x_rhp = x_rhp + torch.nn.functional.conv1d(
+                    x_sums_rhp, weights,
+                    padding="same",
+                )
+            else:
+                # {N, in, L} & {out, in, L} + residual
+                x_sums_rhp_reverse = torch.nn.functional.conv1d(
+                    x_sums_rhp[:, :, :, 1], dilated_weight.flip(-1),
+                    groups=n_motifs,
+                    dilation=2 ** (i - 1),
+                    padding="same"
+                ) / torch.tensor(2.0, device=x1_rhp.device)
+                x_sums_rhp_forward = torch.nn.functional.conv1d(
+                    x_sums_rhp[:, :, :, 0], dilated_weight,
+                    groups=n_motifs,
+                    dilation=2 ** (i - 1),
+                    padding="same"
+                ) / torch.tensor(2.0, device=x1_rhp.device)
+                x_sums_rhp = torch.stack([x_sums_rhp_forward, x_sums_rhp_reverse], dim=-1)
+                x_sums_rhp = einops.rearrange(x_sums_rhp, "r h p f -> r (h f) p", f=2, h=n_motifs)
+                x_rhp_ = torch.nn.functional.conv1d(
+                    x_sums_rhp, weights,
+                    padding="same",
+                )
+                x_rhp_ = einops.rearrange(x_rhp_, "r (h f) p -> r h p f", f=2, h=n_motifs)
+                x_sums_rhp = einops.rearrange(x_sums_rhp, "r (h f) p -> r h p f", f=2, h=n_motifs)
+                x_rhp = x_rhp + x_rhp_
+        x_rhp = x_rhp / torch.tensor(10.0, device=x_rhp.device)
+        x_rhp = torch.nn.functional.softplus(x_rhp) * x1_rhp
+        x_rhp = (x_rhp + x1_rhp * residual_weight) / torch.tensor(2.0, device=x_rhp.device)
+        # print(f"x_rhp {layer} mean", x_rhp.mean())
+        # print(f"x_rhp {layer} min", x_rhp.min())
+        # print(f"x_rhp {layer} max", x_rhp.max())
+        return x_rhp
+
+    def dilated_non_residual_layer(
+        self,
+        x1_rhp: torch.Tensor,
+        width: int = 3,
+        dilation: int = 1,
+        layer=2,
+    ):
+        n_motifs = x1_rhp.shape[-2]
+        scaling = 1.0
+        if self.use_sqrt_normalisation:
+            scaling = 1.0 / np.sqrt(n_motifs * width)
+        weights = self._get_weights(
+            shape=[n_motifs, n_motifs, width],
+            name=f"tn5_layer{layer}",
+            prior_mean=0.0,
+            prior_sigma=scaling,
+        )
+        weights = (
+            weights + weights.flip(-1)
+        ) / torch.tensor(2.0, device=weights.device)
+        # dilated_weight = self._get_positive_weights(
+        #    shape=[n_motifs, 1, width],
+        #    name=f"tn5_layer{layer}_dilated",
+        #    prior_alpha=1.0,
+        # )
+        residual_weight = self._get_positive_weights(
+            shape=[1, n_motifs, 1],
+            name=f"tn5_layer{layer}_residual",
+            prior_alpha=2.0,
+        )
+        # {N, in, L} & {out, in, L} + residual
+        # x_sums_rhp = torch.nn.functional.conv1d(
+        #    x_sums_rhp, dilated_weight,
+        #    groups=n_motifs,
+        #    dilation=dilation,
+        #    padding="same"
+        # ) / torch.tensor(2.0, device=x_sums_rhp.device) # / torch.tensor(float(dilation), device=x_sums_rhp.device)
+        x_rhp = torch.nn.functional.conv1d(
+            x1_rhp, weights,
+            dilation=dilation,
+            padding="same"
+        )
+        x_rhp = x_rhp / torch.tensor(1.0, device=x_rhp.device)
+        x_rhp = torch.nn.functional.softplus(x_rhp) #  * x1_rhp
+        x_rhp = (x_rhp + x1_rhp * residual_weight) / torch.tensor(1.0, device=x_rhp.device)
+        # print(f"x_rhp {layer} mean", x_rhp.mean())
+        # print(f"x_rhp {layer} min", x_rhp.min())
+        # print(f"x_rhp {layer} max", x_rhp.max())
+        return x_rhp
+
     def two_layer_conv1d(
-        self, x, region_motif_coo_rhp: torch.Tensor = None, width: int = 10
+        self, x, region_motif_coo_rhp: torch.Tensor = None, width: int = 10, level3_width: int = 10,
     ):
         # Layer 1 - learning Tn5-DNA motif  ===============================
-        x_rhp = self.one_layer_conv2d(x)
+        x1_rhp = self.one_layer_conv2d(x)
+        #if self.return_forward_revcomp:
+        #    x1_rhp = einops.rearrange(x1_rhp, "r h p f -> r (h f) p", f=2, h=self.n_motifs)
         if region_motif_coo_rhp is not None:
-            x_rhp = torch.concat(
+            x1_rhp = torch.concat(
                 [
-                    x_rhp,
+                    x1_rhp,
                     region_motif_coo_rhp,
                 ],
                 dim=-2,
             )
-        n_motifs = x_rhp.shape[-2]
+        x1_rhp = x1_rhp / torch.tensor(5.0, device=x1_rhp.device)
+        # print("x1_rhp 1 mean", x1_rhp.mean())
+        # print("x1_rhp 1 min", x1_rhp.min())
+        # print("x1_rhp 1 max", x1_rhp.max())
 
-        # Layer 2 - learning interactions between Tn5 sites ===============
-        weights = self._get_weights(
-            shape=[self.n_motifs, n_motifs, width],
-            name="tn5_layer2",
-            prior_mean=0.0,
-            prior_sigma=1.0 / np.sqrt(n_motifs * width),
-        )
-        residual_weight = self._get_positive_weights(
-            shape=[1, n_motifs, 1],
-            name="tn5_layer2_residual",
-            prior_alpha=2.0,
-        )
-        # {N, in, L} & {out, in, L} + residual
-        if region_motif_coo_rhp is not None:
-            x_rhp = torch.concat(
-                [
-                    torch.nn.functional.conv1d(x_rhp, weights, padding="same"),
-                    x_rhp * residual_weight,
-                ],
-                dim=-2,
+        # Layer 2 - learning interactions between Tn5 sites =============== dilated_non_residual_layer
+        if self.use_dilation:
+            i = 2
+            x_rhp, x_sums_rhp = self.dilated_layer(
+                x1_rhp, x1_rhp, width=width, layer=i, dilation=1,
             )
+            i = i + 1
+            for _ in range(self.n_layers - 1):
+                x_rhp, x_sums_rhp = self.dilated_layer(
+                    x_rhp, x_sums_rhp, width=width, layer=i, dilation=2 ** (i - 2),
+                )
+                i = i + 1
+        elif self.use_non_residual_dilation:
+            i = 2
+            x_rhp = self.dilated_non_residual_layer(
+                x1_rhp, width=width, layer=i, dilation=1,
+            )
+            i = i + 1
+            for _ in range(self.n_layers - 1):
+                x_rhp = self.dilated_non_residual_layer(
+                    x_rhp, width=width, layer=i, dilation=2 ** (i - 2),
+                )
+                i = i + 1
+        elif self.use_full_dilated_layer:
+            i = 2
+            x_rhp = self.full_dilated_layer(
+                x1_rhp, width=width, layer=i, dilation=self.dilation,
+            )
+            i = i + 1
+            for _ in range(self.n_layers - 1):
+                x_rhp = self.full_dilated_layer(
+                    x_rhp, width=width, layer=i, dilation=self.dilation,
+                )
+                i = i + 1
         else:
-            x_rhp = (
-                torch.nn.functional.conv1d(x_rhp, weights, padding="same")
-                + x_rhp * residual_weight
+            i = 2
+            x_rhp = self.residual_layer(x1_rhp, region_motif_coo_rhp, width=width, layer=i)
+            i = i + 1
+            for _ in range(self.n_layers - 1):
+                x_rhp = self.residual_layer(x_rhp, region_motif_coo_rhp, width=width, layer=i)
+                i = i + 1
+        # print("x1_rhp 1 mean", x1_rhp.mean())
+        # print("x1_rhp 1 min", x1_rhp.min())
+        # print("x1_rhp 1 max", x1_rhp.max())
+
+        if self.return_forward_revcomp:
+            x_rhp = x_rhp.sum(dim=-1)
+
+        if self.use_competition_normalisation:
+            x_rhp = x_rhp / (x_rhp.sum(-2, keepdim=True) + torch.tensor(1.0, device=x_rhp.device))
+
+        if not self.use_hill_function:
+            # Layer 3 - summing up effects per batch per position ===============
+            n_motifs = x_rhp.shape[-2]
+            scaling = 1.0
+            if self.use_sqrt_normalisation:
+                scaling = 1.0 / np.sqrt(n_motifs * level3_width)
+            weights = self._get_weights(
+                shape=[self.n_hidden, n_motifs, level3_width],
+                name="tn5_layer_out",
+                prior_mean=0.0,
+                prior_sigma=scaling,
             )
-        x_rhp = torch.nn.functional.softplus(x_rhp)
+            weights = (
+                weights + weights.flip(-1)
+            ) / torch.tensor(2.0, device=weights.device)
+            # {N, in, L} & {out, in, L}
+            x_rep = torch.nn.functional.conv1d(x_rhp, weights, padding="same")
+            x_rep = x_rep / torch.tensor(0.2, device=x_rhp.device)
 
-        n_motifs = x_rhp.shape[-2]
-        # Layer 3 - summing up effects per batch per position ===============
-        weights = self._get_weights(
-            shape=[self.n_hidden, n_motifs, width],
-            name="tn5_layer3",
-            prior_mean=0.0,
-            prior_sigma=1.0 / np.sqrt(n_motifs * width),
-        )
-        # {N, in, L} & {out, in, L}
-        x_rep = torch.nn.functional.conv1d(x_rhp, weights, padding=self.padding)
+            # sum across positions
+            # x_rep = torch.nn.functional.adaptive_avg_pool1d(x_rep, 1).squeeze(-1)
+            x_re = x_rep.sum(dim=-1)
 
-        return x_rep
+            # Alternative: use softplus to make the scores positive
+            # and to have a smooth transition across detected values
+            score = torch.nn.functional.softplus(
+                x_re - torch.tensor(2.0, device=x_re.device)
+            ).squeeze(-1) / torch.tensor(0.7, device=x_re.device)
+        else:
+            # sum across positions
+            # x_rep = torch.nn.functional.adaptive_avg_pool1d(x_rep, 1).squeeze(-1)
+            x_rh = x_rhp.sum(dim=-1)
+
+            n_motifs = x_rh.shape[-1]
+            ka_weight = self._get_positive_weights(
+                shape=[1, n_motifs],
+                name=f"tn5_layer_hill_ka",
+                prior_alpha=2.0,
+            )
+            n_weights = self._get_weights(
+                shape=[1, n_motifs],
+                name="tn5_layer_hill_n",
+                prior_mean=0.0,
+                prior_sigma=1.0,
+            )
+            n_max = 4
+            n_prior = 1
+            n_weights = torch.sigmoid(
+                n_weights / torch.tensor(20.0, device=n_weights.device)
+                + torch.logit(torch.tensor(n_prior / n_max, device=n_weights.device))
+            ) * torch.tensor(n_max, device=n_weights.device)
+            x_rh = self.hill_function(x_rh, ka=ka_weight, n=n_weights)
+
+            scaling = 1.0
+            if self.use_sqrt_normalisation:
+                scaling = 1.0 / np.sqrt(n_motifs)
+            weights = self._get_weights(
+                shape=[self.n_hidden, n_motifs],
+                name="tn5_layer_out",
+                prior_mean=0.0,
+                prior_sigma=scaling,
+            )
+            scaling = 1.0
+            if self.use_sqrt_normalisation:
+                scaling = 1.0 / np.sqrt(n_motifs * n_motifs)
+            weights_pairwise = self._get_weights(
+                shape=[self.n_hidden, n_motifs, n_motifs],
+                name="tn5_layer_out_pairwise",
+                prior_mean=0.0,
+                prior_sigma=scaling,
+            )
+
+            x_re = torch.einsum(
+                "rh,zh->rz",
+                x_rh,
+                weights,
+            ) + torch.einsum(
+                "rh,zhm,rm->rz",
+                x_rh,
+                weights_pairwise,
+                x_rh,
+            )
+
+            score = torch.nn.functional.softplus(
+                x_re - torch.tensor(2.0, device=x_re.device)
+            ).squeeze(-1) / torch.tensor(0.7, device=x_re.device)
+
+        return score

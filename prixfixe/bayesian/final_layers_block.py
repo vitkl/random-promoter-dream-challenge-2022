@@ -1,3 +1,4 @@
+import contextlib
 from functools import partial
 import torch
 from torch import nn, Generator
@@ -25,13 +26,28 @@ def init_to_value(site=None, values={}, init_fn=init_to_mean):
 
 class BayesianPyroModel(PyroModule):
 
-    def __init__(self, fixed_motifs, n_out, level2_width=10, tf_affinity_scanner_kwargs=None):
+    def __init__(
+        self,
+        fixed_motifs,
+        n_out,
+        level2_width=10,
+        level3_width=10,
+        sigma_prior=1.0,
+        use_3_rates=False,
+        tf_affinity_scanner_kwargs=None,
+        likelihood_scale=1.0,
+    ):
 
         super().__init__()
 
         self.fixed_motifs = fixed_motifs
         self.n_out = n_out
         self.level2_width = level2_width
+        self.level3_width = level3_width
+        self.sigma_prior = sigma_prior
+        self.use_3_rates = use_3_rates
+        if use_3_rates:
+            self.n_out = 3
 
         self.register_buffer('bins', torch.arange(start=0, end=n_out, step=1, requires_grad=False))
 
@@ -40,6 +56,11 @@ class BayesianPyroModel(PyroModule):
         self.tf_affinity_scanner_kwargs = tf_affinity_scanner_kwargs
 
         self.weights = PyroModule()
+
+        self.likelihood_scale = likelihood_scale
+
+    def create_plates(self, dna_sequence=None, y_probs=None, y=None):
+        return []  # pyro.plate("obs_plate", size=dna_sequence.shape[0], dim=-3)
 
     def forward(self, dna_sequence=None, y_probs=None, y=None):
 
@@ -84,26 +105,74 @@ class BayesianPyroModel(PyroModule):
                 ),
             )
         module = deep_getattr(self.weights, name)
-        x_rep = module(dna_sequence.unsqueeze(-3), width=self.level2_width)
-        x_rep = torch.nn.functional.adaptive_avg_pool1d(x_rep, 1)
-        x_rep = x_rep.squeeze(2) / torch.tensor(10.0, device=x_rep.device)
-        x_rep = torch.nn.functional.softmax(x_rep, dim=1)
-        score = (x_rep * self.bins).sum(dim=1)
+        score = module(
+            dna_sequence.unsqueeze(-3),
+            width=self.level2_width,
+            level3_width=self.level3_width
+        )
+        # print("x_rep mean", x_rep.mean())
+        # print("x_rep min", x_rep.min())
+        # print("x_rep max", x_rep.max())
+        # sum across positions
+        # x_rep = torch.nn.functional.adaptive_avg_pool1d(x_rep, 1).squeeze(-1)
+        # x_re = x_rep.sum(dim=-1)
+        # print("x_rep avg pool mean", x_rep.mean())
+        # print("x_rep avg pool min", x_rep.min())
+        # print("x_rep avg pool max", x_rep.max())
 
-        # plates cannot be used with dataloader batches without providing indices
+        # the prior for bin approach probably has to put most of the probability mass on the first few bins
+        # x_re = x_re + self.bins.flip(-1) / 5
+        # x_re = torch.nn.functional.softmax(x_re, dim=-1)
+        #print("x_re mean", x_re.mean(-2))
+        #print("x_re min", x_re.min(-2))
+        #print("x_re max", x_re.max(-2))
+        #score = (x_re * self.bins).sum(dim=-1)
+
+        # Alternative: use softplus to make the scores positive
+        # and to have a smooth transition across detected values
+        #score = torch.nn.functional.softplus(
+        #    x_re - torch.tensor(2.0, device=x_re.device)
+        #).squeeze(-1) / torch.tensor(0.7, device=x_re.device)
+        #if self.use_3_rates:
+        #    score = score[:, 0] / (score[:, 1] + score[:, 2])
+        #print("score mean", score.mean())
+        #print("score min", score.min())
+        #print("score max", score.max())
+
+        # plates cannot be used with dataloader batches without providing indices (idx)
         # var_plate = pyro.plate("var_plate", size=self.n_obs, dim=-2, subsample=idx)
 
-        if y is not None:
-            pyro.sample(
-                "y",
-                pyro.distributions.Normal(
-                    score,
-                    torch.tensor(1.0, device=score.device),
-                ).to_event(2),
-                obs=y,
-            )
+        sigma = pyro.sample(
+            "sigma",
+            pyro.distributions.Exponential(
+                torch.tensor(self.sigma_prior, device=score.device).expand([1, 1])
+            ).to_event(2)
+        )
 
-        if y_probs is not None:
+        if not self.training:
+            pyro.deterministic("y_pred", score)
+
+        if y is not None:
+            # loss scaling to account for minibatch size
+            likelihood_scale_context = (
+                pyro.poutine.scale(
+                    scale=torch.tensor(self.likelihood_scale / len(y), device=y.device)
+                )
+                if self.likelihood_scale != 1.0
+                else contextlib.nullcontext()
+            )
+            with likelihood_scale_context:
+                pyro.sample(
+                    "y",
+                    pyro.distributions.Normal(
+                        score,
+                        sigma,
+                    ).to_event(2),
+                    obs=y,
+                )
+
+        # if y_probs is not None:
+        if False:
             pyro.sample(
                 "y_probs",
                 pyro.distributions.Multinomial(
@@ -155,7 +224,7 @@ class BayesianFinalLayersBlock(FinalLayersBlock):
         self.differentiable_loss_fn = self.loss_fn.differentiable_loss
         self.scale_elbo = scale_elbo
         self.scale_fn = (
-            lambda obj: pyro.poutine.scale(obj, self.scale_elbo) if self.scale_elbo != 1 else obj
+            lambda obj: pyro.poutine.scale(obj, self.scale_elbo) if self.scale_elbo != 1.0 else obj
         )
 
     @property
@@ -183,6 +252,7 @@ class BayesianFinalLayersBlock(FinalLayersBlock):
 
     def forward(self, dna_sequence):
         score = self.model(dna_sequence=dna_sequence)
+        # score = self.model.final.guide.median(dna_sequence=dna_sequence)["y_pred"]
         return score
 
     def train_step(self, batch):

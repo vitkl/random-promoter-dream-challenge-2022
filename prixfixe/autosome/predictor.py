@@ -85,12 +85,16 @@ class AutosomePredictor(Predictor):
             rev_value=1
         )
         x = x.to(self.device)
-        y = self.model(x[None])[-1].detach().cpu().flatten().tolist()
+        # y = self.model(x[None])[-1]
+        y = self.model.final.guide.median(dna_sequence=x[None])["y_pred"]
+        y = y.detach().cpu().flatten().tolist()
         
         x_rev = x_rev.to(self.device)
-        y_rev = self.model(x_rev[None])[-1].detach().cpu().flatten().tolist()
+        # y_rev = self.model(x_rev[None])[-1]
+        y_rev = self.model.final.guide.median(dna_sequence=x_rev[None])["y_pred"]
+        y_rev = y_rev.detach().cpu().flatten().tolist()
         
         y, y_rev = np.array(y), np.array(y_rev)
 
-        y = (y + y_rev) / 2
-        return y.item()
+        y_total = (y + y_rev) / 2
+        return y_total.item(), y.item(), y_rev.item()
